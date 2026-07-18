@@ -19,9 +19,11 @@ interface AttachedImage {
 interface Props {
   disabled?: boolean;
   onSend: (text: string, files?: string[]) => void;
+  onRagUploadComplete?: (message: string) => void;
 }
 
-const IMAGE_ACCEPT = "image/png,image/jpeg,image/jpg,image/webp,image/gif";
+const RAG_ACCEPT =
+  ".pdf,.txt,.md,.csv,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.html,.htm,.json,.py,.js";
 const MIN_INPUT_HEIGHT = 24;
 const MAX_INPUT_HEIGHT = 160;
 
@@ -32,7 +34,7 @@ function extensionFromMime(mime: string): string {
   return ".png";
 }
 
-export function ChatInput({ disabled, onSend }: Props) {
+export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
   const [value, setValue] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPosition, setMenuPosition] = useState<{
@@ -52,6 +54,54 @@ export function ChatInput({ disabled, onSend }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   attachmentsRef.current = attachments;
+
+  useEffect(() => {
+    if (!uploadError) return;
+    const timer = window.setTimeout(() => setUploadError(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [uploadError]);
+
+  function localizeUploadError(raw: string): string {
+    const text = raw.trim();
+    const lower = text.toLowerCase();
+    try {
+      const parsed = JSON.parse(text) as { detail?: string };
+      if (parsed?.detail) return localizeUploadError(parsed.detail);
+    } catch {
+      /* not JSON */
+    }
+    if (lower.includes("rag document upload is disabled")) {
+      return "RAG 문서 업로드가 비활성화되어 있습니다. Knowledge Base 조회(retrieve)를 사용하세요.";
+    }
+    if (lower.includes("failed to upload file to s3")) {
+      return "S3에 파일 업로드에 실패했습니다.";
+    }
+    if (lower.includes("knowledge base sync failed")) {
+      return "파일은 업로드되었지만 Knowledge Base 동기화에 실패했습니다.";
+    }
+    if (lower.includes("unable to check knowledge base sync")) {
+      return "현재 Knowledge Base 동기화 상태를 확인할 수 없습니다. 잠시 후 다시 시도해주세요.";
+    }
+    if (
+      lower.includes("이전에 업로드된 파일을 처리") ||
+      text.includes("조금후 다시 시도")
+    ) {
+      return "현재 이전에 업로드된 파일을 처리하고 있습니다. 조금후 다시 시도해주세요.";
+    }
+    if (
+      lower.includes("file uploaded but knowledge base sync failed") ||
+      lower.includes("knowledge base sync failed")
+    ) {
+      return "파일은 업로드되었지만 Knowledge Base 동기화에 실패했습니다.";
+    }
+    if (lower.includes("empty file")) return "빈 파일입니다.";
+    if (lower.includes("file name is required")) return "파일 이름이 필요합니다.";
+    if (lower.startsWith("unsupported file type")) {
+      const ext = text.split(":")[1]?.trim() || "(없음)";
+      return `지원하지 않는 파일 형식입니다: ${ext}`;
+    }
+    return text;
+  }
 
   function adjustInputHeight() {
     const el = textareaRef.current;
@@ -212,17 +262,30 @@ export function ChatInput({ disabled, onSend }: Props) {
     });
   }
 
-  function openImageUpload() {
+  function openRagUpload() {
     setMenuOpen(false);
     setUploadError(null);
     fileInputRef.current?.click();
   }
 
   async function onFileSelected(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
+    const files = Array.from(e.target.files ?? []);
     e.target.value = "";
-    if (!file || disabled || uploading) return;
-    await uploadImageFile(file);
+    if (files.length === 0 || disabled || uploading) return;
+
+    setUploading(true);
+    setUploadError(null);
+    try {
+      for (const file of files) {
+        const result = await api.uploadToRag(file);
+        onRagUploadComplete?.(result.message);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setUploadError(localizeUploadError(message));
+    } finally {
+      setUploading(false);
+    }
   }
 
   const inputDisabled = disabled || uploading;
@@ -245,19 +308,18 @@ export function ChatInput({ disabled, onSend }: Props) {
               type="button"
               className="chat-add-menu-item"
               role="menuitem"
-              onClick={openImageUpload}
+              onClick={openRagUpload}
             >
               <span className="chat-add-menu-icon" aria-hidden="true">
                 <svg width="16" height="16" viewBox="0 0 16 16">
                   <path
-                    d="M2.5 3.5h11v9h-11z"
+                    d="M4 2.5h5.5L12 5v8.5a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5v-11a.5.5 0 0 1 .5-.5Z"
                     fill="none"
                     stroke="currentColor"
                     strokeWidth="1.2"
                   />
-                  <circle cx="5.5" cy="6.5" r="1" fill="currentColor" />
                   <path
-                    d="M2.5 11.5 6 8l2 2 2.5-3 3 4.5"
+                    d="M9.5 2.5V5H12"
                     fill="none"
                     stroke="currentColor"
                     strokeWidth="1.2"
@@ -265,9 +327,9 @@ export function ChatInput({ disabled, onSend }: Props) {
                 </svg>
               </span>
               <span className="chat-add-menu-text">
-                <span className="chat-add-menu-label">Attach image</span>
+                <span className="chat-add-menu-label">Upload to RAG</span>
                 <span className="chat-add-menu-desc">
-                  로컬 uploads/에 저장 후 채팅에 첨부
+                  S3에 업로드하고 Knowledge Base 동기화
                 </span>
               </span>
             </button>
@@ -293,27 +355,38 @@ export function ChatInput({ disabled, onSend }: Props) {
           ref={fileInputRef}
           type="file"
           className="chat-file-input"
-          accept={IMAGE_ACCEPT}
+          accept={RAG_ACCEPT}
+          multiple
           onChange={onFileSelected}
           tabIndex={-1}
           aria-hidden="true"
         />
         {attachments.length > 0 && (
-          <div className="chat-attachments" aria-label="첨부 이미지">
-            {attachments.map((item) => (
-              <div key={item.url} className="chat-attachment">
-                <img src={item.previewUrl} alt={item.name} />
-                <button
-                  type="button"
-                  className="chat-attachment-remove"
-                  aria-label={`${item.name} 제거`}
-                  onClick={() => removeAttachment(item.url)}
-                  disabled={inputDisabled}
-                >
-                  ×
-                </button>
-              </div>
-            ))}
+          <div className="chat-attachments" aria-label="첨부 파일">
+            {attachments.map((item) => {
+              const isImage = /\.(png|jpe?g|gif|webp)$/i.test(item.name);
+              return (
+                <div key={item.url} className="chat-attachment">
+                  {isImage ? (
+                    <img src={item.previewUrl} alt={item.name} />
+                  ) : (
+                    <div className="chat-attachment-file" title={item.name}>
+                      <span aria-hidden="true">DOC</span>
+                      <span>{item.name}</span>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    className="chat-attachment-remove"
+                    aria-label={`${item.name} 제거`}
+                    onClick={() => removeAttachment(item.url)}
+                    disabled={inputDisabled}
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
           </div>
         )}
         <textarea

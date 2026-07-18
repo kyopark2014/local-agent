@@ -24,6 +24,7 @@ def _validate_image_filename(filename: str) -> str:
             status_code=400,
             detail=f"Unsupported image type: {ext or '(none)'}",
         )
+    # Avoid collisions when multiple pastes share a generic name
     stem = os.path.splitext(name)[0] or "pasted"
     unique = uuid.uuid4().hex[:10]
     return f"{stem}_{unique}{ext}"
@@ -31,7 +32,7 @@ def _validate_image_filename(filename: str) -> str:
 
 @router.post("/upload")
 async def upload_file(request: Request, file: UploadFile = File(...)):
-    """Upload an image to application/uploads/ for chat attachment (no S3)."""
+    """Upload an image to S3 (images/) for chat attachment. No Knowledge Base sync."""
     require_user_id(request)
 
     file_name = _validate_image_filename(file.filename or "pasted.png")
@@ -39,20 +40,26 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    upload_result = utils.save_upload_locally(file_bytes, file_name)
+    upload_result = utils.upload_to_s3(file_bytes, file_name)
     if not upload_result:
-        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+        raise HTTPException(status_code=500, detail="Failed to upload file to S3")
+    if not upload_result.get("url"):
+        raise HTTPException(
+            status_code=500,
+            detail="File uploaded but sharing URL is not configured",
+        )
 
     logger.info(
-        "File upload complete: file=%s path=%s",
+        "File upload complete: file=%s s3_key=%s url=%s",
         file_name,
-        upload_result.get("path"),
+        upload_result.get("s3_key"),
+        upload_result.get("url"),
     )
 
     return {
         "ok": True,
         "file_name": upload_result["file_name"],
-        "path": upload_result["path"],
+        "s3_key": upload_result["s3_key"],
         "url": upload_result["url"],
         "content_type": upload_result.get("content_type"),
     }

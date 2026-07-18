@@ -328,11 +328,18 @@ def sanitize_data_source_name(name):
 knowledge_base_id = config.get('knowledge_base_id')
 data_source_id = config.get('data_source_id')
 region = config.get('region', 'us-west-2')
-sharing_url = ''
+s3_bucket = config.get(
+    's3_bucket',
+    f'storage-for-rag-project-{accountId}-{region}' if accountId else '',
+)
+sharing_url = config.get('sharing_url', '')
+
 
 def update_rag_info():
-    """Resolve knowledge_base_id from config name if missing. No S3 / data-source sync."""
-    knowledge_base_id_local = config.get('knowledge_base_id')
+    """Resolve knowledge_base_id / data_source_id from Bedrock Agent API and persist."""
+    global knowledge_base_id, data_source_id, s3_bucket
+    kb_id = config.get('knowledge_base_id')
+    ds_id = None
     try:
         client = boto3.client(
             service_name='bedrock-agent',
@@ -342,44 +349,83 @@ def update_rag_info():
         response = client.list_knowledge_bases(maxResults=50)
         logger.info(f"(list_knowledge_bases) response: {response}")
 
-        knowledge_base_name = config.get("knowledge_base_name") or config.get("projectName")
-        if knowledge_base_id_local:
-            return knowledge_base_id_local, None
-
-        if "knowledgeBaseSummaries" in response and knowledge_base_name:
+        knowledge_base_name = config.get("knowledge_base_name") or config.get("projectName") or "rag-project"
+        if not kb_id and "knowledgeBaseSummaries" in response:
             for summary in response["knowledgeBaseSummaries"]:
                 if summary["name"] == knowledge_base_name:
-                    knowledge_base_id_local = summary["knowledgeBaseId"]
-                    logger.info(f"knowledge_base_id: {knowledge_base_id_local}")
+                    kb_id = summary["knowledgeBaseId"]
+                    logger.info(f"knowledge_base_id: {kb_id}")
                     break
 
-        if not knowledge_base_id_local:
+        if not kb_id:
             logger.warning(
                 "Knowledge Base not found for name=%s; set knowledge_base_id in config.json",
                 knowledge_base_name,
             )
             return None, None
 
-        config['knowledge_base_id'] = knowledge_base_id_local
+        bucket = s3_bucket or config.get('s3_bucket')
+        if not bucket and accountId:
+            bucket = f'storage-for-rag-project-{accountId}-{region}'
+            s3_bucket = bucket
+
+        if not bucket:
+            logger.warning("s3_bucket is not configured, skipping data source lookup")
+            config['knowledge_base_id'] = kb_id
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            return kb_id, None
+
+        response = client.list_data_sources(
+            knowledgeBaseId=kb_id,
+            maxResults=10,
+        )
+        logger.info(f"(list_data_sources) response: {response}")
+
+        data_source_name = sanitize_data_source_name(bucket)
+        if 'dataSourceSummaries' in response:
+            for data_source in response['dataSourceSummaries']:
+                logger.info(f"data_source: {data_source}")
+                if data_source['name'] == data_source_name:
+                    ds_id = data_source['dataSourceId']
+                    logger.info(f"data_source_id: {ds_id}")
+                    break
+            # Fallback: use the first ACTIVE data source if name mismatch
+            if not ds_id:
+                for data_source in response['dataSourceSummaries']:
+                    if data_source.get('status') == 'AVAILABLE':
+                        ds_id = data_source['dataSourceId']
+                        logger.info(f"using first AVAILABLE data_source_id: {ds_id}")
+                        break
+
+        config['knowledge_base_id'] = kb_id
+        if ds_id:
+            config['data_source_id'] = ds_id
+        config['s3_bucket'] = bucket
         config['region'] = region
         config['projectName'] = projectName
         if accountId:
             config['accountId'] = accountId
         with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
+            json.dump(config, f, indent=2, ensure_ascii=False)
+
+        knowledge_base_id = kb_id
+        data_source_id = ds_id
+        s3_bucket = bucket
+        return kb_id, ds_id
 
     except Exception:
         err_msg = traceback.format_exc()
         logger.info(f"error message: {err_msg}")
+        return kb_id, None
 
-    return knowledge_base_id_local, None
 
-if not knowledge_base_id:
+if not knowledge_base_id or not data_source_id:
     knowledge_base_id, data_source_id = update_rag_info()
 
 
 def save_upload_locally(file_bytes: bytes, file_name: str) -> dict | None:
-    """Save a file under application/uploads/ and return metadata (no S3)."""
+    """Save a file under application/uploads/ and return metadata (chat attachments)."""
     try:
         uploads_dir = os.path.join(workingDir, "uploads")
         os.makedirs(uploads_dir, exist_ok=True)
@@ -400,12 +446,152 @@ def save_upload_locally(file_bytes: bytes, file_name: str) -> dict | None:
         return None
 
 
-# Compatibility aliases (local-agent does not use S3)
+ACTIVE_INGESTION_STATUSES = ("STARTING", "IN_PROGRESS")
+
+
+class IngestionInProgressError(Exception):
+    """Raised when Bedrock rejects start_ingestion_job because a sync is already running."""
+
+
+def _bedrock_agent_client():
+    return boto3.client(
+        service_name="bedrock-agent",
+        region_name=bedrock_region,
+    )
+
+
+def get_active_ingestion_job() -> dict | None:
+    """Return an in-flight ingestion job if Knowledge Base sync is already running."""
+    if not knowledge_base_id or not data_source_id:
+        logger.error("knowledge_base_id or data_source_id is not configured")
+        return None
+
+    try:
+        bedrock_client = _bedrock_agent_client()
+        for status in ACTIVE_INGESTION_STATUSES:
+            response = bedrock_client.list_ingestion_jobs(
+                knowledgeBaseId=knowledge_base_id,
+                dataSourceId=data_source_id,
+                filters=[
+                    {
+                        "attribute": "STATUS",
+                        "operator": "EQ",
+                        "values": [status],
+                    }
+                ],
+                maxResults=1,
+                sortBy={
+                    "attribute": "STARTED_AT",
+                    "order": "DESCENDING",
+                },
+            )
+            summaries = response.get("ingestionJobSummaries") or []
+            if not summaries:
+                continue
+            job = summaries[0]
+            logger.info("Active ingestion job found: %s", job)
+            return {
+                "ingestion_job_id": job.get("ingestionJobId"),
+                "status": job.get("status"),
+                "started_at": str(job["startedAt"]) if job.get("startedAt") else None,
+            }
+        return None
+    except Exception:
+        logger.error("Error listing ingestion jobs: %s", traceback.format_exc())
+        raise
+
+
+def sync_data_source() -> dict | None:
+    """Start a Knowledge Base ingestion job for the configured data source."""
+    global knowledge_base_id, data_source_id
+    if not knowledge_base_id or not data_source_id:
+        knowledge_base_id, data_source_id = update_rag_info()
+    if not knowledge_base_id or not data_source_id:
+        logger.error("knowledge_base_id or data_source_id is not configured")
+        return None
+
+    try:
+        bedrock_client = _bedrock_agent_client()
+        response = bedrock_client.start_ingestion_job(
+            knowledgeBaseId=knowledge_base_id,
+            dataSourceId=data_source_id,
+        )
+        logger.info("start_ingestion_job response: %s", response)
+        job = response.get("ingestionJob", {})
+        return {
+            "ingestion_job_id": job.get("ingestionJobId"),
+            "status": job.get("status"),
+        }
+    except Exception as e:
+        # Concurrent sync: Bedrock ConflictException → same UX as active-job 409
+        error_name = type(e).__name__
+        error_code = ""
+        if hasattr(e, "response") and isinstance(getattr(e, "response", None), dict):
+            error_code = (
+                e.response.get("Error", {}).get("Code")
+                or e.response.get("Error", {}).get("errorCode")
+                or ""
+            )
+        msg = str(e).lower()
+        if (
+            error_name == "ConflictException"
+            or error_code in ("ConflictException", "Conflict")
+            or "conflict" in msg
+            or "already in progress" in msg
+            or "ingestion job" in msg and "progress" in msg
+        ):
+            logger.warning("Ingestion already in progress: %s", e)
+            raise IngestionInProgressError(str(e)) from e
+        logger.error("Error syncing data source: %s", traceback.format_exc())
+        return None
+
 def upload_to_s3(file_bytes: bytes, file_name: str) -> dict | None:
-    return save_upload_locally(file_bytes, file_name)
+    """Upload a file to S3 under docs/ (or images/) and return upload metadata."""
+    global s3_bucket
+    if not s3_bucket:
+        s3_bucket = config.get('s3_bucket') or (
+            f'storage-for-rag-project-{accountId}-{region}' if accountId else ''
+        )
+    if not s3_bucket:
+        logger.error("s3_bucket is not configured")
+        return None
 
+    try:
+        s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
+        content_type = get_contents_type(file_name)
+        logger.info("content_type: %s", content_type)
 
-def sync_data_source():
-    """Disabled: local-agent does not ingest documents into Knowledge Base via S3."""
-    logger.warning("sync_data_source is disabled in local-agent")
-    return None
+        prefix = "images" if content_type.startswith("image/") else "docs"
+        s3_key = f"{prefix}/{file_name}"
+        user_meta = {"content_type": content_type}
+
+        put_params = {
+            "Bucket": s3_bucket,
+            "Key": s3_key,
+            "Metadata": user_meta,
+            "Body": file_bytes,
+        }
+        if content_type != "no info":
+            put_params["ContentType"] = content_type
+        if content_type == "application/pdf":
+            put_params["ContentDisposition"] = "inline"
+
+        response = s3_client.put_object(**put_params)
+        logger.info("upload response: %s", response)
+
+        # Prefer CloudFront/sharing URL; fall back to s3:// so chat can still pass a ref
+        if sharing_url:
+            url = f"{sharing_url.rstrip('/')}/{prefix}/{parse.quote(file_name)}"
+        else:
+            url = f"s3://{s3_bucket}/{s3_key}"
+
+        return {
+            "file_name": file_name,
+            "s3_key": s3_key,
+            "content_type": content_type,
+            "url": url,
+            "bucket": s3_bucket,
+        }
+    except Exception:
+        logger.error("Error uploading to S3: %s", traceback.format_exc())
+        return None

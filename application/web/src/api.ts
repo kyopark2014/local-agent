@@ -1,10 +1,22 @@
 import type { AppConfig, Message, StreamEvent, Task } from "./types";
 import { uiError, uiLog } from "./debug";
 
+export interface RagUploadResult {
+  ok: boolean;
+  file_name: string;
+  s3_key: string;
+  url?: string | null;
+  message: string;
+  sync?: {
+    ingestion_job_id?: string;
+    status?: string;
+  };
+}
+
 export interface FileUploadResult {
   ok: boolean;
   file_name: string;
-  path?: string;
+  s3_key: string;
   url: string;
   content_type?: string;
 }
@@ -72,6 +84,24 @@ export const api = {
     request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
   getMessages: (id: string) =>
     request<{ messages: Message[] }>(`/api/tasks/${id}/messages`),
+  uploadToRag: async (file: File): Promise<RagUploadResult> => {
+    uiLog("rag:upload start", { name: file.name, size: file.size });
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch("/api/rag/upload", {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      uiError("rag:upload failed", { status: res.status, body: text });
+      throw new Error(text || res.statusText);
+    }
+    const data = (await res.json()) as RagUploadResult;
+    uiLog("rag:upload complete", data);
+    return data;
+  },
   uploadFile: async (file: File): Promise<FileUploadResult> => {
     uiLog("file:upload start", { name: file.name, size: file.size, type: file.type });
     const form = new FormData();

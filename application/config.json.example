@@ -2,7 +2,11 @@
   "region": "us-west-2",
   "projectName": "local-agent",
   "knowledge_base_id": "<existing-kb-id>",
-  "knowledge_base_name": "<optional>",
+  "knowledge_base_name": "rag-project",
+  "accountId": "<aws-account-id>",
+  "s3_bucket": "storage-for-rag-project-<aws-account-id>-us-west-2",
+  "data_source_id": "<optional-auto-resolved>",
+  "sharing_url": "",
   "default_mcp_servers": [
     "knowledge base",
     "tavily",

@@ -245,6 +245,20 @@ export default function App() {
     setMessages([]);
   }
 
+  async function handleRagUploadComplete(message: string) {
+    if (!activeTaskId) return;
+    const notice: Message = {
+      id: `rag-upload-${randomUUID()}`,
+      task_id: activeTaskId,
+      role: "assistant",
+      content: message,
+      images: [],
+      tool_events: [],
+      created_at: new Date().toISOString(),
+    };
+    setMessages((prev) => [...prev, notice]);
+  }
+
   async function handleSend(prompt: string, files: string[] = []) {
     if (!activeTaskId) {
       uiError("chat:send skipped — no active task");
@@ -367,6 +381,7 @@ export default function App() {
             <ChatInput
               disabled={!activeTask || activeStream.streaming}
               onSend={handleSend}
+              onRagUploadComplete={handleRagUploadComplete}
             />
           }
         />

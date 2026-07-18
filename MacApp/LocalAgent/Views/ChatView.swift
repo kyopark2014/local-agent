@@ -6,6 +6,7 @@ struct ChatView: View {
     @EnvironmentObject private var appState: AppState
     @State private var draft = ""
     @State private var isDropTargeted = false
+    @State private var pasteMonitor: Any?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -18,6 +19,8 @@ struct ChatView: View {
             guard !appState.isStreaming && !appState.isUploading else { return false }
             return handleDrop(providers)
         }
+        .onAppear { installPasteMonitor() }
+        .onDisappear { removePasteMonitor() }
         .overlay {
             if isDropTargeted {
                 RoundedRectangle(cornerRadius: 12)
@@ -27,6 +30,8 @@ struct ChatView: View {
             }
         }
     }
+
+    // MARK: - Clipboard paste (screenshot → S3 → agent)
 
     private var taskHeader: some View {
         HStack(spacing: 8) {
@@ -123,7 +128,30 @@ struct ChatView: View {
     }
 
     private var inputBar: some View {
-        VStack(spacing: 0) {
+        // Banner↔composer gap ≈ tool↔AI mid spacing (14)
+        VStack(spacing: appState.composerBanner != nil ? 14 : 0) {
+            if let banner = appState.composerBanner {
+                Text(banner)
+                    .font(.system(size: 13))
+                    .foregroundStyle(
+                        appState.composerBannerIsError
+                            ? Color(red: 0.98, green: 0.55, blue: 0.55)
+                            : CodexTheme.textSecondary
+                    )
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(
+                        appState.composerBannerIsError
+                            ? Color(red: 0.35, green: 0.12, blue: 0.12).opacity(0.95)
+                            : CodexTheme.elevated
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .chatContentColumn()
+                    .onTapGesture { appState.clearComposerBanner() }
+            }
+
             if !appState.pendingAttachments.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -136,9 +164,20 @@ struct ChatView: View {
                                         .frame(width: 56, height: 56)
                                         .clipShape(RoundedRectangle(cornerRadius: 8))
                                 } else {
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .fill(CodexTheme.elevated)
-                                        .frame(width: 56, height: 56)
+                                    VStack(spacing: 4) {
+                                        Image(systemName: "doc.fill")
+                                            .font(.system(size: 18))
+                                            .foregroundStyle(CodexTheme.textSecondary)
+                                        Text(item.name)
+                                            .font(.system(size: 9))
+                                            .foregroundStyle(CodexTheme.textMuted)
+                                            .lineLimit(2)
+                                            .multilineTextAlignment(.center)
+                                            .frame(maxWidth: 64)
+                                    }
+                                    .frame(width: 72, height: 56)
+                                    .background(CodexTheme.elevated)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
                                 }
                                 Button {
                                     appState.removeAttachment(item.id)
@@ -182,7 +221,7 @@ struct ChatView: View {
 
                 HStack(spacing: 10) {
                     Button {
-                        pickImages()
+                        pickRagFiles()
                     } label: {
                         Image(systemName: "plus")
                             .font(.system(size: 13, weight: .semibold))
@@ -192,7 +231,7 @@ struct ChatView: View {
                             .clipShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .help("Attach image")
+                    .help("Upload to RAG (PDF, docs → S3 + Knowledge Base)")
                     .disabled(!inputEnabled)
 
                     Spacer(minLength: 0)
@@ -222,7 +261,8 @@ struct ChatView: View {
             .overlay(RoundedRectangle(cornerRadius: 16).stroke(CodexTheme.border))
             .opacity(appState.isStreaming ? 0.55 : 1)
             .chatContentColumn()
-            .padding(.vertical, 16)
+            .padding(.top, appState.composerBanner != nil ? 0 : 16)
+            .padding(.bottom, 16)
             .background(CodexTheme.canvas)
         }
     }
@@ -246,33 +286,107 @@ struct ChatView: View {
         Task { await appState.sendMessage(text: text) }
     }
 
-    private func pickImages() {
+    private func pickRagFiles() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.png, .jpeg, .gif, .webP]
+        // agent-skills / agentic-work RAG_ACCEPT
+        panel.allowedContentTypes = [
+            .pdf,
+            .plainText, .utf8PlainText,
+            UTType(filenameExtension: "md") ?? .plainText,
+            UTType(filenameExtension: "csv") ?? .commaSeparatedText,
+            .commaSeparatedText,
+            UTType(filenameExtension: "doc") ?? .data,
+            UTType(filenameExtension: "docx") ?? .data,
+            UTType(filenameExtension: "ppt") ?? .data,
+            UTType(filenameExtension: "pptx") ?? .data,
+            UTType(filenameExtension: "xls") ?? .data,
+            UTType(filenameExtension: "xlsx") ?? .data,
+            .html,
+            .json,
+            UTType(filenameExtension: "py") ?? .sourceCode,
+            UTType(filenameExtension: "js") ?? .sourceCode,
+        ].compactMap { $0 }
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.begin { response in
             guard response == .OK else { return }
             Task {
                 for url in panel.urls {
-                    await appState.attachImage(from: url)
+                    await appState.uploadToRag(from: url)
                 }
             }
         }
     }
 
+    private static let imageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "webp",
+    ]
+
+    private func installPasteMonitor() {
+        removePasteMonitor()
+        let state = appState
+        pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let isPaste =
+                event.modifierFlags.contains(.command)
+                && (event.charactersIgnoringModifiers == "v" || event.charactersIgnoringModifiers == "V")
+            guard isPaste else { return event }
+            guard !state.isStreaming, !state.isUploading else { return event }
+            guard let image = Self.imageFromPasteboard() else { return event }
+            Task { @MainActor in
+                await state.attachPastedImage(image)
+            }
+            return nil // consume Cmd+V when clipboard holds an image
+        }
+    }
+
+    private func removePasteMonitor() {
+        if let pasteMonitor {
+            NSEvent.removeMonitor(pasteMonitor)
+            self.pasteMonitor = nil
+        }
+    }
+
+    private static func imageFromPasteboard() -> NSImage? {
+        let pb = NSPasteboard.general
+        if let png = pb.data(forType: .png), let image = NSImage(data: png) {
+            return image
+        }
+        if let tiff = pb.data(forType: .tiff), let image = NSImage(data: tiff) {
+            return image
+        }
+        if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage],
+           let image = images.first {
+            return image
+        }
+        return nil
+    }
+
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         var handled = false
         for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+                && !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                handled = true
+                provider.loadObject(ofClass: NSImage.self) { object, _ in
+                    guard let image = object as? NSImage else { return }
+                    Task { @MainActor in
+                        await appState.attachPastedImage(image)
+                    }
+                }
+                continue
+            }
             if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
                 handled = true
                 provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
                     guard let data = item as? Data,
                           let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
                     let ext = url.pathExtension.lowercased()
-                    guard ["png", "jpg", "jpeg", "gif", "webp"].contains(ext) else { return }
                     Task { @MainActor in
-                        await appState.attachImage(from: url)
+                        if Self.imageExtensions.contains(ext) {
+                            await appState.attachImage(from: url)
+                        } else {
+                            await appState.uploadToRag(from: url)
+                        }
                     }
                 }
             }
@@ -290,7 +404,7 @@ struct MessageBubble: View {
                 Spacer(minLength: 48)
                 VStack(alignment: .trailing, spacing: 6) {
                     if !message.images.isEmpty {
-                        Text(message.images.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", "))
+                        Text(message.images.map { URL(string: $0)?.lastPathComponent ?? ($0 as NSString).lastPathComponent }.joined(separator: ", "))
                             .font(.caption2)
                             .foregroundStyle(CodexTheme.textMuted)
                     }

@@ -68,7 +68,12 @@ knowledge_base_name = config.get("knowledge_base_name")
 UPLOADS_DIR = os.path.join(workingDir, "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 doc_prefix = "docs/"
-path = ""  # local-agent: no sharing_url / CloudFront
+s3_image_prefix = "images"
+s3_bucket = config.get("s3_bucket") or (
+    f"storage-for-rag-project-{accountId}-{bedrock_region}" if accountId else ""
+)
+sharing_url = config.get("sharing_url") or ""
+path = sharing_url  # agentic-work parity: public base for uploaded images
 
 model_name = "Claude 5.0 Sonnet"
 model_type = "claude"
@@ -923,39 +928,120 @@ def _prepare_image_base64(image_content: bytes) -> tuple[str, str]:
     return img_base64, "image/png"
 
 
-def _load_image_bytes_from_ref(file_ref: str) -> tuple[str, bytes]:
-    """Load image bytes from a local path or uploads/ file name."""
+def _resolve_upload_path(file_ref: str) -> tuple[str, str]:
+    """Return (file_name, absolute_path) for a local upload ref."""
     raw = (file_ref or "").strip()
     if not raw:
         raise ValueError("파일 이름을 확인할 수 없습니다.")
 
     if os.path.isabs(raw) and os.path.isfile(raw):
-        file_name = os.path.basename(raw)
-        local_path = raw
-    else:
-        file_name = _file_name_from_ref(raw)
-        if not file_name:
-            raise ValueError("파일 이름을 확인할 수 없습니다.")
-        local_path = os.path.join(UPLOADS_DIR, file_name)
-        if not os.path.isfile(local_path):
-            # also accept artifacts/ or working-dir relative paths
-            alt = os.path.join(workingDir, file_name)
-            if os.path.isfile(alt):
-                local_path = alt
-            else:
-                raise FileNotFoundError(f"Upload not found: {local_path}")
+        return os.path.basename(raw), raw
 
+    file_name = _file_name_from_ref(raw)
+    if not file_name:
+        raise ValueError("파일 이름을 확인할 수 없습니다.")
+    local_path = os.path.join(UPLOADS_DIR, file_name)
+    if os.path.isfile(local_path):
+        return file_name, local_path
+    alt = os.path.join(workingDir, file_name)
+    if os.path.isfile(alt):
+        return file_name, alt
+    raise FileNotFoundError(f"Upload not found: {local_path}")
+
+
+def _load_image_bytes_from_s3(file_name: str) -> bytes:
+    """Load image bytes from S3 images/ (agentic-work parity)."""
+    bucket = s3_bucket or config.get("s3_bucket") or ""
+    if not bucket:
+        raise RuntimeError("s3_bucket is not configured")
+    s3_key = f"{s3_image_prefix}/{file_name}"
+    logger.info(f"loading image from s3://{bucket}/{s3_key}")
+    s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
+    image_obj = s3_client.get_object(Bucket=bucket, Key=s3_key)
+    return image_obj["Body"].read()
+
+
+def _load_image_bytes_from_ref(file_ref: str) -> tuple[str, bytes]:
+    """Load image bytes from S3 (preferred) or a local uploads/ path."""
+    file_name = _file_name_from_ref(file_ref)
+    if not file_name:
+        raise ValueError("파일 이름을 확인할 수 없습니다.")
     file_type = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
     if file_type not in ("png", "jpeg", "jpg", "webp", "gif"):
         raise ValueError(f"지원하지 않는 이미지 형식입니다: {file_type or '(unknown)'}")
 
+    # Prefer S3 when configured (paste → /api/files/upload → images/)
+    bucket = s3_bucket or config.get("s3_bucket") or ""
+    if bucket:
+        try:
+            return file_name, _load_image_bytes_from_s3(file_name)
+        except Exception as e:
+            logger.warning("S3 image load failed (%s); trying local path", e)
+
+    file_name, local_path = _resolve_upload_path(file_ref)
     logger.info(f"loading image from {local_path}")
     with open(local_path, "rb") as f:
         return file_name, f.read()
 
 
+def _extract_text_from_document(file_path: str, file_type: str) -> str:
+    """Best-effort text extraction for chat-attached documents."""
+    if file_type in ("txt", "md", "csv", "json", "py", "js", "html", "htm"):
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    if file_type == "pdf":
+        try:
+            import pdfplumber
+
+            parts: list[str] = []
+            with pdfplumber.open(file_path) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text() or ""
+                    if text.strip():
+                        parts.append(text)
+            return "\n\n".join(parts).strip()
+        except Exception as e:
+            logger.warning("pdfplumber failed (%s); trying pypdf", e)
+            try:
+                from pypdf import PdfReader
+
+                reader = PdfReader(file_path)
+                parts = [(page.extract_text() or "") for page in reader.pages]
+                return "\n\n".join(parts).strip()
+            except Exception as e2:
+                raise RuntimeError(f"PDF 텍스트 추출 실패: {e2}") from e2
+
+    if file_type in ("docx",):
+        try:
+            import docx  # python-docx
+
+            doc = docx.Document(file_path)
+            return "\n".join(p.text for p in doc.paragraphs if p.text).strip()
+        except Exception as e:
+            raise RuntimeError(f"DOCX 텍스트 추출 실패: {e}") from e
+
+    if file_type in ("xlsx", "xls"):
+        try:
+            import openpyxl
+
+            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+            rows: list[str] = []
+            for sheet in wb.worksheets:
+                rows.append(f"## {sheet.title}")
+                for row in sheet.iter_rows(values_only=True):
+                    cells = ["" if c is None else str(c) for c in row]
+                    if any(cells):
+                        rows.append("\t".join(cells))
+            return "\n".join(rows).strip()
+        except Exception as e:
+            raise RuntimeError(f"Excel 텍스트 추출 실패: {e}") from e
+
+    raise ValueError(f"지원하지 않는 파일 형식입니다: {file_type or '(unknown)'}")
+
+
 def build_human_message_with_files(prompt: str, files: list | None = None) -> HumanMessage:
-    """Build a multimodal HumanMessage: attached images + user text."""
+    """Build a multimodal HumanMessage: attached images/docs + user text."""
     text = (prompt or "").strip()
     file_list = files or []
     if not isinstance(file_list, list):
@@ -967,6 +1053,7 @@ def build_human_message_with_files(prompt: str, files: list | None = None) -> Hu
 
     content_blocks: list[dict] = []
     image_names: list[str] = []
+    doc_names: list[str] = []
 
     for file_ref in file_list:
         try:
@@ -985,11 +1072,13 @@ def build_human_message_with_files(prompt: str, files: list | None = None) -> Hu
             # Fall back to text summary for this file
             try:
                 summary = get_summary_of_uploaded_file(file_ref, prompt=text)
+                name = _file_name_from_ref(file_ref)
+                doc_names.append(name)
                 content_blocks.append(
                     {
                         "type": "text",
                         "text": (
-                            f"선택한 파일({_file_name_from_ref(file_ref)})의 내용을 "
+                            f"선택한 파일({name})의 내용을 "
                             f"요약하면 아래와 같습니다.\n\n{summary}"
                         ),
                     }
@@ -1003,13 +1092,16 @@ def build_human_message_with_files(prompt: str, files: list | None = None) -> Hu
                 )
 
     if not text:
-        if image_names:
+        if image_names and not doc_names:
             text = (
                 f"첨부한 이미지({', '.join(image_names)})를 자세히 설명해주세요. "
                 "구성 요소, 레이블, 화살표/연결 관계, 전체 의미를 markdown으로 정리하세요."
             )
+        elif doc_names:
+            names = ", ".join(doc_names + image_names)
+            text = f"첨부한 파일({names})을 바탕으로 요약·설명해 주세요."
         else:
-            text = "첨부한 이미지를 분석해주세요."
+            text = "첨부한 파일을 분석해주세요."
 
     content_blocks.append({"type": "text", "text": text})
     return HumanMessage(content=content_blocks)
@@ -1059,14 +1151,14 @@ def _file_name_from_ref(file_ref: str) -> str:
 
 
 def get_summary_of_uploaded_file(file_ref: str, prompt: str = "") -> str:
-    """Analyze an uploaded file (by local path or name) and return a text summary.
+    """Analyze an uploaded file (by sharing URL, S3 ref, or local path) and return a text summary.
 
-    Images are loaded from application/uploads/ and summarized with vision.
+    Images are loaded from S3 under images/ (agentic-work parity) and summarized with vision.
+    Documents fall back to local text extraction when available.
     """
     file_name = _file_name_from_ref(file_ref)
     if not file_name:
         return "파일 이름을 확인할 수 없습니다."
-
     file_type = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
     logger.info(f"get_summary_of_uploaded_file: file_name={file_name}, file_type={file_type}")
 
@@ -1074,7 +1166,19 @@ def get_summary_of_uploaded_file(file_ref: str, prompt: str = "") -> str:
         _name, image_content = _load_image_bytes_from_ref(file_ref)
         return summarize_image(image_content, prompt or "")
 
-    return f"지원하지 않는 파일 형식입니다: {file_type or '(unknown)'}"
+    try:
+        _name, local_path = _resolve_upload_path(file_ref)
+    except Exception as e:
+        return f"지원하지 않는 파일 형식입니다: {file_type or '(unknown)'} ({e})"
+
+    extracted = _extract_text_from_document(local_path, file_type)
+    if not extracted:
+        return f"파일({file_name})에서 텍스트를 추출하지 못했습니다."
+    # Keep prompt context reasonable for the model
+    max_chars = 30000
+    if len(extracted) > max_chars:
+        extracted = extracted[:max_chars] + "\n\n…(이하 생략)"
+    return extracted
 
 ####################### Bedrock Agent #######################
 # RAG using Lambda
@@ -1354,8 +1458,6 @@ def extract_thinking_tag(response):
     return msg
 
 tool_input_list = dict()
-
-sharing_url = None
 
 
 def _urls_from_file_saved_message(tool_content) -> list:

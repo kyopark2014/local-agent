@@ -16,6 +16,9 @@ final class AppState: ObservableObject {
     @Published var errorMessage: String?
     @Published var pendingAttachments: [AttachedImage] = []
     @Published var isUploading: Bool = false
+    /// Shown above the chat composer (agent-skills chat-upload-error / status)
+    @Published var composerBanner: String?
+    @Published var composerBannerIsError: Bool = false
     /// UI zoom factor (⌘+/⌘−). Persisted.
     @Published var uiScale: Double = UserDefaults.standard.object(forKey: "uiScale") as? Double ?? 1.0
 
@@ -86,6 +89,10 @@ final class AppState: ObservableObject {
         let url: String
         let name: String
         let preview: NSImage?
+        var isImage: Bool {
+            let ext = (name as NSString).pathExtension.lowercased()
+            return ["png", "jpg", "jpeg", "gif", "webp"].contains(ext)
+        }
     }
 
     func bootstrap() async {
@@ -283,7 +290,7 @@ final class AppState: ObservableObject {
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty || !files.isEmpty else { return }
 
-        let display = prompt.isEmpty ? "첨부한 이미지를 분석해주세요." : prompt
+        let display = prompt.isEmpty ? "첨부한 파일을 분석해주세요." : prompt
         let optimistic = ChatMessage(
             id: "pending-\(UUID().uuidString)",
             taskId: taskId,
@@ -452,16 +459,163 @@ final class AppState: ObservableObject {
 
     func attachImage(from url: URL) async {
         isUploading = true
+        composerBanner = "업로드 중..."
+        composerBannerIsError = false
         defer { isUploading = false }
         do {
             let accessed = url.startAccessingSecurityScopedResource()
             defer { if accessed { url.stopAccessingSecurityScopedResource() } }
             let result = try await api.uploadImage(fileURL: url)
-            let preview = NSImage(contentsOf: url)
+            let ext = url.pathExtension.lowercased()
+            let preview = ["png", "jpg", "jpeg", "gif", "webp"].contains(ext)
+                ? NSImage(contentsOf: url)
+                : nil
             pendingAttachments.append(AttachedImage(url: result.url, name: result.fileName, preview: preview))
+            clearComposerBanner()
         } catch {
-            errorMessage = error.localizedDescription
+            showComposerBanner(friendlyAPIError(error), isError: true)
         }
+    }
+
+    /// Paste screenshot / clipboard image → S3 (`/api/files/upload`) → chat attachment.
+    func attachPastedImage(_ image: NSImage) async {
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let pngData = rep.representation(using: .png, properties: [:]) else {
+            showComposerBanner("클립보드 이미지를 읽을 수 없습니다.", isError: true)
+            return
+        }
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pasted_screenshot.png")
+        do {
+            try pngData.write(to: tmp)
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            isUploading = true
+            composerBanner = "업로드 중..."
+            composerBannerIsError = false
+            defer { isUploading = false }
+            let result = try await api.uploadImage(fileURL: tmp)
+            pendingAttachments.append(
+                AttachedImage(url: result.url, name: result.fileName, preview: image)
+            )
+            clearComposerBanner()
+        } catch {
+            showComposerBanner(friendlyAPIError(error), isError: true)
+        }
+    }
+
+    /// Upload document to S3 and start Knowledge Base ingestion (agent-skills parity).
+    func uploadToRag(from url: URL) async {
+        isUploading = true
+        composerBanner = "업로드 중..."
+        composerBannerIsError = false
+        defer { isUploading = false }
+        do {
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+            let result = try await api.uploadToRag(fileURL: url)
+            // Prefer API message (agentic-work parity); fall back to fileName if empty
+            let message: String = {
+                let trimmed = result.message.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+                let name = result.fileName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty {
+                    return "\"\(name)\"가 S3에 업로드 되었고 Knowledge Base와 동기화를 시작합니다."
+                }
+                return "파일이 S3에 업로드 되었고 Knowledge Base와 동기화를 시작합니다."
+            }()
+            showComposerBanner(message, isError: false)
+        } catch {
+            showComposerBanner(friendlyAPIError(error), isError: true)
+        }
+    }
+
+    private var composerBannerTask: Task<Void, Never>?
+
+    func clearComposerBanner() {
+        composerBannerTask?.cancel()
+        composerBannerTask = nil
+        composerBanner = nil
+        composerBannerIsError = false
+    }
+
+    func showComposerBanner(_ text: String, isError: Bool) {
+        composerBannerTask?.cancel()
+        composerBanner = localizeComposerMessage(text)
+        composerBannerIsError = isError
+        // agentic-work: 에러 배너는 5초 후 자동 숨김 (성공도 동일)
+        composerBannerTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !Task.isCancelled else { return }
+            if composerBanner != nil {
+                composerBanner = nil
+                composerBannerIsError = false
+            }
+        }
+    }
+
+    private func friendlyAPIError(_ error: Error) -> String {
+        if case APIError.http(_, let body) = error {
+            if let data = body.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let detail = obj["detail"] as? String {
+                return localizeComposerMessage(detail)
+            }
+            if !body.isEmpty { return localizeComposerMessage(body) }
+        }
+        return localizeComposerMessage(error.localizedDescription)
+    }
+
+    /// Map common English API/UI strings to Korean (agent-skills style UX).
+    private func localizeComposerMessage(_ raw: String) -> String {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = text.lowercased()
+
+        if lower.contains("rag document upload is disabled") {
+            return "RAG 문서 업로드가 비활성화되어 있습니다. Knowledge Base 조회(retrieve)를 사용하세요."
+        }
+        if lower.contains("failed to upload file to s3") {
+            return "S3에 파일 업로드에 실패했습니다."
+        }
+        if lower.contains("file uploaded but knowledge base sync failed")
+            || lower.contains("knowledge base sync failed") {
+            return "파일은 업로드되었지만 Knowledge Base 동기화에 실패했습니다."
+        }
+        if lower.contains("unable to check knowledge base sync") {
+            return "현재 Knowledge Base 동기화 상태를 확인할 수 없습니다. 잠시 후 다시 시도해주세요."
+        }
+        if lower.contains("이전에 업로드된 파일을 처리") || lower.contains("조금후 다시") {
+            return "현재 이전에 업로드된 파일을 처리하고 있습니다. 조금후 다시 시도해주세요."
+        }
+        if lower.contains("empty file") {
+            return "빈 파일입니다."
+        }
+        if lower.contains("file name is required") {
+            return "파일 이름이 필요합니다."
+        }
+        if lower.hasPrefix("unsupported file type") {
+            let ext = text.split(separator: ":").last.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
+            return "지원하지 않는 파일 형식입니다: \(ext.isEmpty ? "(없음)" : ext)"
+        }
+        // Success: pass through API message (Korean, agentic-work parity)
+        if text.contains("S3에 업로드") && text.contains("Knowledge Base") {
+            return text
+        }
+        if lower.contains("was uploaded to s3 and knowledge base sync was started") {
+            // legacy English API message → Korean
+            let parts = text.split(separator: "\"", omittingEmptySubsequences: false)
+            let name = parts.count >= 2
+                ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
+            if !name.isEmpty {
+                return "\"\(name)\"가 S3에 업로드 되었고 Knowledge Base와 동기화를 시작합니다."
+            }
+            return "파일이 S3에 업로드 되었고 Knowledge Base와 동기화를 시작합니다."
+        }
+        if text == "업로드 중..." || text.hasPrefix("\"") && text.contains("동기화") {
+            return text
+        }
+        return text
     }
 
     func removeAttachment(_ id: UUID) {

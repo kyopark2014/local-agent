@@ -59,6 +59,7 @@ discord.py
 # Skills / documents
 PyPDF2
 python-pptx
+python-docx
 defusedxml
 lxml
 openpyxl

@@ -111,6 +111,7 @@ struct FileUploadResult: Codable {
     var ok: Bool
     var fileName: String
     var path: String?
+    var s3Key: String?
     var url: String
     var contentType: String?
 
@@ -118,6 +119,7 @@ struct FileUploadResult: Codable {
         case ok
         case fileName = "file_name"
         case path, url
+        case s3Key = "s3_key"
         case contentType = "content_type"
     }
 }

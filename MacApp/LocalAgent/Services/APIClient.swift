@@ -139,6 +139,47 @@ final class APIClient {
         return try decoder.decode(FileUploadResult.self, from: respData)
     }
 
+    struct RagUploadResult: Codable {
+        var ok: Bool
+        var fileName: String
+        var s3Key: String
+        var url: String?
+        var message: String
+
+        enum CodingKeys: String, CodingKey {
+            case ok, message, url
+            case fileName = "file_name"
+            case s3Key = "s3_key"
+        }
+    }
+
+    func uploadToRag(fileURL: URL) async throws -> RagUploadResult {
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/rag/upload"))
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 300
+
+        let filename = fileURL.lastPathComponent
+        let data = try Data(contentsOf: fileURL)
+        let mime = mimeType(for: fileURL)
+
+        var body = Data()
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: \(mime)\r\n\r\n".data(using: .utf8)!)
+        body.append(data)
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        request.httpBody = body
+
+        let (respData, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw APIError.emptyResponse }
+        guard (200..<300).contains(http.statusCode) else {
+            throw APIError.http(http.statusCode, String(data: respData, encoding: .utf8) ?? "")
+        }
+        return try decoder.decode(RagUploadResult.self, from: respData)
+    }
+
     /// Stream chat SSE events. Calls `onEvent` on the cooperative context for each parsed event.
     func streamChat(
         taskId: String,
@@ -239,6 +280,20 @@ final class APIClient {
         case "png": return "image/png"
         case "gif": return "image/gif"
         case "webp": return "image/webp"
+        case "pdf": return "application/pdf"
+        case "txt": return "text/plain"
+        case "md": return "text/markdown"
+        case "csv": return "text/csv"
+        case "json": return "application/json"
+        case "html", "htm": return "text/html"
+        case "doc": return "application/msword"
+        case "docx": return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        case "ppt": return "application/vnd.ms-powerpoint"
+        case "pptx": return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        case "xls": return "application/vnd.ms-excel"
+        case "xlsx": return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        case "py": return "text/x-python"
+        case "js": return "text/javascript"
         default: return "application/octet-stream"
         }
     }

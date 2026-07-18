@@ -5,9 +5,9 @@ Mac에서 단독 실행하는 MCP/Skill 기반 로컬 에이전트입니다.
 - **권장 UI:** SwiftUI 네이티브 앱 ([`MacApp/`](MacApp/))
 - **백엔드:** Python FastAPI + LangGraph (포트 8501)
 - **LLM:** Amazon Bedrock
-- **지식:** 기존 Bedrock Knowledge Base **조회(retrieve)**
+- **지식:** Bedrock Knowledge Base **조회(retrieve)** + 문서 **S3 업로드 / KB sync**
 - **도구:** 로컬 MCP(stdio) + 로컬 Skills
-- **제외:** S3 업로드/공유 URL, CloudFront, AgentCore Gateway 웹검색, AgentCore Memory
+- **제외:** CloudFront 공유 URL(선택), AgentCore Gateway 웹검색, AgentCore Memory
 
 Optional: React Web UI (`./run_local.sh`) — 개발/디버그용.
 
@@ -79,6 +79,14 @@ cp application/config.json.example application/config.json
 # 또는
 python scripts/setup_config.py
 ```
+
+`config.json`에 다음을 확인하세요.
+
+| 키 | 설명 |
+|----|------|
+| `knowledge_base_id` / `knowledge_base_name` | Bedrock KB |
+| `s3_bucket` | RAG 문서 업로드 버킷 (예: `storage-for-rag-project-<accountId>-<region>`) |
+| `data_source_id` | 없으면 기동 시 KB의 S3 data source에서 자동 조회 |
 
 ## Build and Run
 
@@ -183,4 +191,5 @@ cd application && npm install && cd web && npm install && npm run build && cd ..
 
 - **유지:** knowledge base, tavily, filesystem, korea_weather, browser-use, outlook 등
 - **제외:** AgentCore Gateway `websearch`, AgentCore Memory MCP
-- KB 문서 인제스트 UI 없음 (retrieve만)
+- KB 문서: `+` → Upload to RAG (S3 `docs/` + Knowledge Base ingestion)
+- 채팅 이미지 → `application/uploads/` (붙여넣기/드래그)
