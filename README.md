@@ -143,6 +143,23 @@ cd MacApp && swift build
 
 자세한 내용: [MacApp/README.md](MacApp/README.md)
 
+### macOS 배포 패키지 (`.app` / `.dmg` / `.zip`)
+
+```bash
+chmod +x scripts/build_macos_release.sh
+./scripts/build_macos_release.sh
+```
+
+결과물은 `dist/` 에 생성됩니다.
+
+| 파일 | 설명 |
+|------|------|
+| `dist/Seyeon.app` | 실행 앱 |
+| `dist/Seyeon-*-macos.dmg` | Applications 드래그 설치용 |
+| `dist/Seyeon-*-macos.zip` | 압축 배포용 |
+
+앱은 로컬 Python 백엔드(`local-agent` 저장소)가 필요합니다. 경로가 다르면 **Settings → Repo root**를 지정하세요.
+
 ### Web UI로 실행 (optional)
 
 Xcode 설치 전이거나 웹으로 보고 싶을 때:

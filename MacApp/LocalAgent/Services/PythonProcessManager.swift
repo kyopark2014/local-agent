@@ -19,19 +19,21 @@ final class PythonProcessManager: ObservableObject {
         if let stored = UserDefaults.standard.string(forKey: "repoRoot"), !stored.isEmpty {
             return URL(fileURLWithPath: stored)
         }
-        // MacApp/ is inside local-agent/; Bundle is .../LocalAgent.app/Contents/MacOS
-        // Prefer walking up from common locations.
+        // MacApp/ is inside local-agent/; Bundle is .../Seyeon.app/Contents/MacOS
+        let appDir = Bundle.main.bundleURL.deletingLastPathComponent()
         let candidates: [URL] = [
             URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent() // Services
                 .deletingLastPathComponent() // LocalAgent
                 .deletingLastPathComponent() // MacApp
                 .deletingLastPathComponent(), // local-agent
-            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents/src/local-agent"),
+            appDir.appendingPathComponent("local-agent"),
+            appDir,
             Bundle.main.bundleURL
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .deletingLastPathComponent(),
+            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents/src/local-agent"),
         ]
         for url in candidates {
             let marker = url.appendingPathComponent("application/server.py")

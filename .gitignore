@@ -1,6 +1,7 @@
 # Python
 .venv/
 venv/
+dist/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -37,3 +38,6 @@ MacApp/.build/
 MacApp/DerivedData/
 MacApp/**/xcuserdata/
 *.xcuserstate
+
+# Release artifacts
+dist/

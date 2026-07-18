@@ -35,6 +35,16 @@ swift build
 
 App Sandbox is **off** so the process can start Python and read the repo.
 
+## Release package
+
+From the repo root:
+
+```bash
+./scripts/build_macos_release.sh
+```
+
+Produces `dist/Seyeon.app`, `.zip`, and `.dmg`.
+
 ## Settings
 
 **Local Agent → Settings…**
