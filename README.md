@@ -1,4 +1,4 @@
-# local-agent
+# Agent 애플리케이션의 구현
 
 Mac에서 단독 실행하는 MCP/Skill 기반 로컬 에이전트입니다.
 
