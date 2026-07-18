@@ -1,0 +1,39 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+application/node_modules/
+application/web/node_modules/
+application/web/dist/
+application/package-lock.json
+*.tsbuildinfo
+
+# Secrets & local runtime
+application/config.json
+application/MEMORY.md
+application/memory/
+application/data/
+application/user_*.json
+application/.session_storage/
+application/uploads/*
+!application/uploads/.gitkeep
+application/graphify-out/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Swift / Xcode
+MacApp/.build/
+MacApp/DerivedData/
+MacApp/**/xcuserdata/
+*.xcuserstate

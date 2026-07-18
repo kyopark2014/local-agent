@@ -1,0 +1,411 @@
+import logging
+import sys
+import json
+import traceback
+import boto3
+import os
+from urllib import parse
+from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
+
+logging.basicConfig(
+    level=logging.INFO,  # Default to INFO level
+    format='%(filename)s:%(lineno)d | %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stderr)
+    ]
+)
+logger = logging.getLogger("utils")
+
+aws_access_key = os.environ.get('AWS_ACCESS_KEY_ID')
+aws_secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
+aws_session_token = os.environ.get('AWS_SESSION_TOKEN')
+
+workingDir = os.path.dirname(os.path.abspath(__file__))
+config_path = os.path.join(workingDir, "config.json")
+    
+def load_config():
+    config = None
+
+    try: 
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading config: {e}")
+        config = {}
+
+        projectName = "local-agent"
+        session = boto3.Session()
+        region = session.region_name or "us-west-2"
+        config['region'] = region
+        config['projectName'] = projectName
+        
+        try:
+            sts = boto3.client("sts")
+            response = sts.get_caller_identity()
+            config['accountId'] = response["Account"]
+        except Exception as sts_err:
+            logger.warning(f"Could not resolve accountId: {sts_err}")
+        
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)    
+    return config
+
+config = load_config()
+
+accountId = config.get('accountId')
+if not accountId:
+    sts = boto3.client("sts")
+    response = sts.get_caller_identity()
+    accountId = response["Account"]
+    config['accountId'] = accountId
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+bedrock_region = config.get('region', 'us-west-2')
+logger.info(f"bedrock_region: {bedrock_region}")
+projectName = config.get('projectName', 'mop')
+logger.info(f"projectName: {projectName}")
+
+
+def persist_config_updates(updates):
+    """Merge values fetched from Secrets Manager into config and write config.json."""
+    global config
+    if not updates:
+        return
+    changed = False
+    for key, value in updates.items():
+        if value is None:
+            continue
+        s = value.strip() if isinstance(value, str) else str(value)
+        if not s:
+            continue
+        if config.get(key) != s:
+            config[key] = s
+            changed = True
+    if not changed:
+        return
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        logger.info(
+            "Saved Secrets Manager values to config.json: %s",
+            ", ".join(str(k) for k in updates if updates.get(k)),
+        )
+    except Exception as e:
+        logger.warning("Failed to write config.json: %s", e)
+
+
+def get_contents_type(file_name):
+    lower = file_name.lower()
+    if lower.endswith((".jpg", ".jpeg")):
+        content_type = "image/jpeg"
+    elif lower.endswith(".png"):
+        content_type = "image/png"
+    elif lower.endswith(".webp"):
+        content_type = "image/webp"
+    elif lower.endswith(".gif"):
+        content_type = "image/gif"
+    elif lower.endswith(".pdf"):
+        content_type = "application/pdf"
+    elif lower.endswith(".txt"):
+        content_type = "text/plain"
+    elif lower.endswith(".csv"):
+        content_type = "text/csv"
+    elif lower.endswith((".ppt", ".pptx")):
+        content_type = "application/vnd.ms-powerpoint"
+    elif lower.endswith((".doc", ".docx")):
+        content_type = "application/msword"
+    elif lower.endswith((".xls", ".xlsx")):
+        content_type = "application/vnd.ms-excel"
+    elif lower.endswith(".py"):
+        content_type = "text/x-python"
+    elif lower.endswith(".js"):
+        content_type = "application/javascript"
+    elif lower.endswith(".md"):
+        content_type = "text/markdown"
+    else:
+        content_type = "no info"
+    return content_type
+
+def load_mcp_env():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    mcp_env_path = os.path.join(script_dir, "mcp.env")
+    
+    with open(mcp_env_path, "r", encoding="utf-8") as f:
+        mcp_env = json.load(f)
+    return mcp_env
+
+def save_mcp_env(mcp_env):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    mcp_env_path = os.path.join(script_dir, "mcp.env")
+    
+    with open(mcp_env_path, "w", encoding="utf-8") as f:
+        json.dump(mcp_env, f)
+
+# api key to get information in agent
+if aws_access_key and aws_secret_key:
+    secretsmanager = boto3.client(
+        service_name='secretsmanager',
+        region_name=bedrock_region,
+        aws_access_key_id=aws_access_key,
+        aws_secret_access_key=aws_secret_key,
+        aws_session_token=aws_session_token,
+    )
+else:
+    secretsmanager = boto3.client(
+        service_name='secretsmanager',
+        region_name=bedrock_region
+    )
+
+# Tavily Search API key: prefer config.json, else Secrets Manager
+tavily_api_wrapper = ""
+tavily_key = (config.get("tavily_api_key") or "").strip()
+if tavily_key:
+    tavily_api_wrapper = TavilySearchAPIWrapper(tavily_api_key=tavily_key)
+    os.environ["TAVILY_API_KEY"] = tavily_key
+else:
+    try:
+        get_tavily_api_secret = secretsmanager.get_secret_value(
+            SecretId="tavilyapikey"
+        )
+        secret = json.loads(get_tavily_api_secret["SecretString"])
+
+        if "tavily_api_key" in secret:
+            tavily_key = (secret["tavily_api_key"] or "").strip()
+
+        if tavily_key:
+            tavily_api_wrapper = TavilySearchAPIWrapper(tavily_api_key=tavily_key)
+            os.environ["TAVILY_API_KEY"] = tavily_key
+            persist_config_updates({"tavily_api_key": tavily_key})
+        else:
+            logger.info("tavily_key is required.")
+    except Exception as e:
+        logger.info(f"Tavily credential is required: {e}")
+        pass
+
+# Notion API key: prefer config.json, else Secrets Manager
+notion_api_key = (config.get("notion_api_key") or "").strip()
+if notion_api_key:
+    os.environ["NOTION_API_KEY"] = notion_api_key
+else:
+    try:
+        get_notion_api_secret = secretsmanager.get_secret_value(
+            SecretId="notionapikey"
+        )
+        secret = json.loads(get_notion_api_secret["SecretString"])
+
+        if "notion_api_key" in secret:
+            notion_api_key = (secret["notion_api_key"] or "").strip()
+
+        if notion_api_key:
+            os.environ["NOTION_API_KEY"] = notion_api_key
+            persist_config_updates({"notion_api_key": notion_api_key})
+        else:
+            logger.info("notion_api_key is required.")
+    except Exception as e:
+        logger.info(f"Notion credential is required: {e}")
+        pass
+
+# Telegram API key: prefer config.json, else Secrets Manager
+telegram_api_key = (config.get("telegram_api_key") or "").strip()
+if telegram_api_key:
+    os.environ["TELEGRAM_API_KEY"] = telegram_api_key
+else:
+    try:
+        get_telegram_api_secret = secretsmanager.get_secret_value(
+            SecretId="telegramapikey"
+        )
+        secret = json.loads(get_telegram_api_secret["SecretString"])
+
+        if "telegram_api_key" in secret:
+            telegram_api_key = (secret["telegram_api_key"] or "").strip()
+
+        if telegram_api_key:
+            os.environ["TELEGRAM_API_KEY"] = telegram_api_key
+            persist_config_updates({"telegram_api_key": telegram_api_key})
+        else:
+            logger.info("telegram_api_key is required.")
+    except Exception as e:
+        logger.info(f"Telegram credential is required: {e}")
+        pass
+
+# Discord bot token: prefer config.json, else Secrets Manager
+discord_bot_token = (config.get("discord_bot_token") or "").strip()
+if discord_bot_token:
+    os.environ["DISCORD_BOT_TOKEN"] = discord_bot_token
+else:
+    try:
+        get_discord_secret = secretsmanager.get_secret_value(
+            SecretId="discordapikey"
+        )
+        secret = json.loads(get_discord_secret["SecretString"])
+
+        if "discord_bot_token" in secret:
+            discord_bot_token = (secret["discord_bot_token"] or "").strip()
+
+        if discord_bot_token:
+            os.environ["DISCORD_BOT_TOKEN"] = discord_bot_token
+            persist_config_updates({"discord_bot_token": discord_bot_token})
+        else:
+            logger.info("discord_bot_token is required.")
+    except Exception as e:
+        logger.info(f"Discord credential is required: {e}")
+        pass
+
+# Slack: prefer config.json; any missing fields are filled from Secrets Manager
+slack_bot_token = (config.get("slack_bot_token") or "").strip()
+slack_team_id = (config.get("slack_team_id") or "").strip()
+slack_token_from_config = bool(slack_bot_token)
+slack_team_from_config = bool(slack_team_id)
+if slack_bot_token:
+    os.environ["SLACK_BOT_TOKEN"] = slack_bot_token
+if slack_team_id:
+    os.environ["SLACK_TEAM_ID"] = slack_team_id
+
+if not slack_bot_token or not slack_team_id:
+    try:
+        get_slack_secret = secretsmanager.get_secret_value(
+            SecretId="slackapikey"
+        )
+        secret = json.loads(get_slack_secret["SecretString"])
+        if not slack_bot_token:
+            slack_bot_token = (secret.get("slack_bot_token") or "").strip()
+            if slack_bot_token:
+                os.environ["SLACK_BOT_TOKEN"] = slack_bot_token
+        if not slack_team_id:
+            slack_team_id = (secret.get("slack_team_id") or "").strip()
+            if slack_team_id:
+                os.environ["SLACK_TEAM_ID"] = slack_team_id
+        slack_persist = {}
+        if not slack_token_from_config and slack_bot_token:
+            slack_persist["slack_bot_token"] = slack_bot_token
+        if not slack_team_from_config and slack_team_id:
+            slack_persist["slack_team_id"] = slack_team_id
+        persist_config_updates(slack_persist)
+    except Exception as e:
+        logger.info(f"Slack credential is required: {e}")
+        pass
+
+def sanitize_data_source_name(name):
+    """
+    Sanitize a name to comply with AWS Bedrock data source name pattern:
+    ([0-9a-zA-Z][_-]?){1,100}
+    - Pattern means: alphanumeric, optionally followed by underscore or hyphen, repeated 1-100 times
+    - Cannot have consecutive underscores or hyphens
+    - Must start with alphanumeric
+    """
+    import re
+    # Remove any characters that are not alphanumeric, underscore, or hyphen
+    sanitized = re.sub(r'[^0-9a-zA-Z_-]', '', name)
+    
+    # Replace consecutive underscores/hyphens with single hyphen
+    # This ensures the pattern [0-9a-zA-Z][_-]? is followed correctly
+    sanitized = re.sub(r'[_-]{2,}', '-', sanitized)
+    
+    # Ensure it starts with alphanumeric character
+    if sanitized and not sanitized[0].isalnum():
+        sanitized = 'ds' + sanitized
+    
+    # Remove trailing hyphens/underscores (they must be followed by alphanumeric per pattern)
+    sanitized = sanitized.rstrip('_-')
+    
+    # Ensure it's not empty and limit to 100 characters
+    if not sanitized:
+        sanitized = 'datasource'
+    
+    # Final validation: ensure it matches the pattern exactly
+    pattern = re.compile(r'^([0-9a-zA-Z][_-]?){1,100}$')
+    if not pattern.match(sanitized):
+        # If still doesn't match, create a safe default name
+        # Use project name or create a simple alphanumeric name
+        safe_name = re.sub(r'[^0-9a-zA-Z]', '', name.lower())
+        if not safe_name:
+            safe_name = 'datasource'
+        sanitized = safe_name[:100]
+    
+    return sanitized[:100]
+
+knowledge_base_id = config.get('knowledge_base_id')
+data_source_id = config.get('data_source_id')
+region = config.get('region', 'us-west-2')
+sharing_url = ''
+
+def update_rag_info():
+    """Resolve knowledge_base_id from config name if missing. No S3 / data-source sync."""
+    knowledge_base_id_local = config.get('knowledge_base_id')
+    try:
+        client = boto3.client(
+            service_name='bedrock-agent',
+            region_name=region
+        )
+
+        response = client.list_knowledge_bases(maxResults=50)
+        logger.info(f"(list_knowledge_bases) response: {response}")
+
+        knowledge_base_name = config.get("knowledge_base_name") or config.get("projectName")
+        if knowledge_base_id_local:
+            return knowledge_base_id_local, None
+
+        if "knowledgeBaseSummaries" in response and knowledge_base_name:
+            for summary in response["knowledgeBaseSummaries"]:
+                if summary["name"] == knowledge_base_name:
+                    knowledge_base_id_local = summary["knowledgeBaseId"]
+                    logger.info(f"knowledge_base_id: {knowledge_base_id_local}")
+                    break
+
+        if not knowledge_base_id_local:
+            logger.warning(
+                "Knowledge Base not found for name=%s; set knowledge_base_id in config.json",
+                knowledge_base_name,
+            )
+            return None, None
+
+        config['knowledge_base_id'] = knowledge_base_id_local
+        config['region'] = region
+        config['projectName'] = projectName
+        if accountId:
+            config['accountId'] = accountId
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+
+    except Exception:
+        err_msg = traceback.format_exc()
+        logger.info(f"error message: {err_msg}")
+
+    return knowledge_base_id_local, None
+
+if not knowledge_base_id:
+    knowledge_base_id, data_source_id = update_rag_info()
+
+
+def save_upload_locally(file_bytes: bytes, file_name: str) -> dict | None:
+    """Save a file under application/uploads/ and return metadata (no S3)."""
+    try:
+        uploads_dir = os.path.join(workingDir, "uploads")
+        os.makedirs(uploads_dir, exist_ok=True)
+        safe_name = os.path.basename(file_name)
+        dest = os.path.join(uploads_dir, safe_name)
+        content_type = get_contents_type(file_name)
+        with open(dest, "wb") as f:
+            f.write(file_bytes)
+        logger.info("saved upload locally: %s", dest)
+        return {
+            "file_name": safe_name,
+            "path": dest,
+            "content_type": content_type,
+            "url": dest,
+        }
+    except Exception:
+        logger.error("Error saving upload locally: %s", traceback.format_exc())
+        return None
+
+
+# Compatibility aliases (local-agent does not use S3)
+def upload_to_s3(file_bytes: bytes, file_name: str) -> dict | None:
+    return save_upload_locally(file_bytes, file_name)
+
+
+def sync_data_source():
+    """Disabled: local-agent does not ingest documents into Knowledge Base via S3."""
+    logger.warning("sync_data_source is disabled in local-agent")
+    return None

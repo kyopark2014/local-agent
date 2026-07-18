@@ -1,0 +1,19 @@
+__pycache__/
+
+# configuration & local runtime
+config.json
+MEMORY.md
+memory/
+node_modules/
+graphify-out/
+package-lock.json
+*.py[cod]
+.session_storage/
+uploads/*
+!uploads/.gitkeep
+
+# local task / user session data
+data/
+user_*.json
+artifacts/*
+!artifacts/.gitkeep
