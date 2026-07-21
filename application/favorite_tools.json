@@ -1,0 +1,11 @@
+{
+  "MCP": [
+    "knowledge base",
+    "tavily",
+    "filesystem",
+    "korea_weather"
+  ],
+  "SKILL": [
+    "docx"
+  ]
+}

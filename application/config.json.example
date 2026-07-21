@@ -6,20 +6,5 @@
   "accountId": "<aws-account-id>",
   "s3_bucket": "storage-for-rag-project-<aws-account-id>-us-west-2",
   "data_source_id": "<optional-auto-resolved>",
-  "sharing_url": "",
-  "default_mcp_servers": [
-    "knowledge base",
-    "tavily",
-    "filesystem",
-    "korea_weather"
-  ],
-  "default_skills": [
-    "retrieve",
-    "tavily-search",
-    "memory-manager",
-    "pdf",
-    "docx",
-    "xlsx",
-    "pptx"
-  ]
+  "sharing_url": ""
 }
