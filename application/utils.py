@@ -23,7 +23,40 @@ aws_session_token = os.environ.get('AWS_SESSION_TOKEN')
 workingDir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(workingDir, "config.json")
 favorite_tools_path = os.path.join(workingDir, "favorite_tools.json")
-    
+# Local session root for per-user durable DBs (and artifacts when used).
+SESSION_STORAGE_DIR = os.environ.get(
+    "SESSION_STORAGE_DIR",
+    os.path.join(workingDir, ".session_storage"),
+)
+
+
+def sanitize_user_path_segment(user_id: str | None) -> str | None:
+    """Return a safe single path segment for per-user workspace folders, or None."""
+    if not user_id:
+        return None
+    raw = str(user_id).strip()
+    # Never treat opaque signed session cookies as folder names.
+    if raw.startswith("v1.") and raw.count(".") >= 2:
+        logger.warning("Refusing signed session token as path segment")
+        return None
+    if len(raw) > 128:
+        logger.warning("Refusing oversized user_id as path segment")
+        return None
+    segment = (
+        raw
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace("..", "_")
+    )
+    return segment or None
+
+
+def get_user_db_path(user_id: str | None) -> str:
+    """Durable per-user tasks/messages DB: {SESSION_STORAGE_DIR}/{user_id}/{user_id}.db."""
+    segment = sanitize_user_path_segment(user_id) or "default"
+    return os.path.join(SESSION_STORAGE_DIR, segment, f"{segment}.db")
+
+
 def load_config():
     config = None
 
