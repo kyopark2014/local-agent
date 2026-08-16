@@ -21,7 +21,10 @@ logger = logging.getLogger("routes_chat")
 router = APIRouter(prefix="/api/tasks", tags=["chat"])
 
 SSE_HEARTBEAT_INTERVAL_SECONDS = 15
+# Idle timeout: no agent queue output for this long → treat as stuck.
 AGENT_STREAM_TIMEOUT_SECONDS = 300
+# Absolute safety cap for a single chat turn (4 hours).
+AGENT_STREAM_MAX_SECONDS = 14400
 DEFAULT_IMAGE_PROMPT = "첨부한 이미지를 분석해주세요."
 
 _TOOL_INPUT_RE = re.compile(r"^Tool: (.+?), Input:\s*(.*)$", re.DOTALL)
@@ -321,10 +324,18 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
         streamed_text = ""
 
         try:
-            deadline = time.monotonic() + AGENT_STREAM_TIMEOUT_SECONDS
+            started_at = time.monotonic()
+            # Idle deadline resets whenever the agent emits something.
+            deadline = started_at + AGENT_STREAM_TIMEOUT_SECONDS
+            max_deadline = started_at + AGENT_STREAM_MAX_SECONDS
             while True:
-                remaining = deadline - time.monotonic()
+                now = time.monotonic()
+                hard_remaining = max_deadline - now
+                idle_remaining = deadline - now
+                remaining = min(hard_remaining, idle_remaining)
                 if remaining <= 0:
+                    timed_out_idle = idle_remaining <= 0
+                    elapsed = int(now - started_at)
                     error_text = "Agent timeout"
                     task_store.add_message(
                         task_id, "assistant", f"Error: {error_text}", user_id=user_id
@@ -345,6 +356,9 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
 
                 if item is None:
                     break
+
+                # Progress received — extend idle window.
+                deadline = time.monotonic() + AGENT_STREAM_TIMEOUT_SECONDS
 
                 mapped = _map_sink_event(item)
                 if not mapped:
