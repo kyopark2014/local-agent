@@ -66,9 +66,7 @@ export function ToolCallCard({ event }: Props) {
     const label = formatToolResultLabel(event.tool, event.mcpServer, skillName);
     return (
       <details className="tool-card">
-        <summary>
-          {formatToolResultLabel(event.tool, event.mcpServer, skillName)}
-        </summary>
+        <summary>{label}</summary>
         <pre>{event.data}</pre>
       </details>
     );
