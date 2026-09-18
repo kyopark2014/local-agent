@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, type PointerEvent as ReactPointerEvent } from "react";
 import { formatBrandTitle } from "../formatBrandTitle";
 import type { AppConfig, Task } from "../types";
 import { ConfigDrawer } from "./ConfigDrawer";
@@ -22,6 +22,9 @@ interface Props {
   onPatchTask: (taskId: string, patch: Partial<Task>) => void;
   onDeleteTask: (taskId: string) => void;
   onLogout: () => void;
+  sidebarResizing?: boolean;
+  onSidebarResizeStart?: (e: ReactPointerEvent<HTMLDivElement>) => void;
+  onSidebarResizeReset?: () => void;
 }
 
 export function Sidebar({
@@ -39,6 +42,9 @@ export function Sidebar({
   onPatchTask,
   onDeleteTask,
   onLogout,
+  sidebarResizing = false,
+  onSidebarResizeStart,
+  onSidebarResizeReset,
 }: Props) {
   const skillBtnRef = useRef<HTMLButtonElement>(null);
   const mcpBtnRef = useRef<HTMLButtonElement>(null);
@@ -187,6 +193,18 @@ export function Sidebar({
             />
           </label>
         </div>
+
+        {onSidebarResizeStart && (
+          <div
+            className={`sidebar-resizer${sidebarResizing ? " is-active" : ""}`}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize task panel"
+            title="Drag to resize · double-click to reset"
+            onPointerDown={onSidebarResizeStart}
+            onDoubleClick={onSidebarResizeReset}
+          />
+        )}
       </aside>
 
       {drawer === "skill" && config && activeTask && (
