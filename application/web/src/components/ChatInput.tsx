@@ -10,6 +10,8 @@ import {
 import { createPortal } from "react-dom";
 import { api } from "../api";
 
+import type { ToolEvent } from "../types";
+import { AgentActivityStrip } from "./AgentActivityStrip";
 interface AttachedImage {
   url: string;
   name: string;
@@ -18,6 +20,13 @@ interface AttachedImage {
 
 interface Props {
   disabled?: boolean;
+  /** True while waiting for an assistant response. */
+  waiting?: boolean;
+  /** Live tool timeline used for the composer activity strip. */
+  streamEvents?: ToolEvent[];
+  /** In-progress assistant text (shows “응답 작성 중” when tools are idle). */
+  streamText?: string;
+
   onSend: (text: string, files?: string[]) => void;
   onRagUploadComplete?: (message: string) => void;
 }
@@ -34,7 +43,14 @@ function extensionFromMime(mime: string): string {
   return ".png";
 }
 
-export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
+export function ChatInput({
+  disabled,
+  waiting = false,
+  streamEvents = [],
+  streamText = "",
+  onSend,
+  onRagUploadComplete,
+}: Props) {
   const [value, setValue] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPosition, setMenuPosition] = useState<{
@@ -339,7 +355,12 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
       : null;
 
   return (
-    <div className="chat-input-area">
+    <div className={`chat-input-area${waiting ? " is-waiting" : ""}`}>
+      <AgentActivityStrip
+        waiting={waiting}
+        streamEvents={streamEvents}
+        streamText={streamText}
+      />
       {uploadError && (
         <div className="chat-upload-error" role="alert">
           {uploadError}

@@ -439,6 +439,9 @@ export default function App() {
           footer={
             <ChatInput
               disabled={!activeTask || activeStream.streaming}
+              waiting={activeStream.streaming}
+              streamEvents={activeStream.streamEvents}
+              streamText={activeStream.streamText}
               onSend={handleSend}
               onRagUploadComplete={handleRagUploadComplete}
             />
